@@ -9,13 +9,9 @@ import os
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict
-from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, Float, DateTime, ForeignKey, LargeBinary
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, scoped_session
-
-# Load environment variables
-load_dotenv()
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -139,6 +135,9 @@ class Database:
         Base.metadata.create_all(self.engine)
         session_factory = sessionmaker(bind=self.engine)
         self.Session = scoped_session(session_factory)
+
+        # Force SQLAlchemy to refresh its metadata
+        Base.metadata.reflect(bind=self.engine)
         
     def get_user_by_telegram_id(self, telegram_id: int) -> Optional[User]:
         """Get user by Telegram ID"""

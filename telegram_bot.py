@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Abraxas Greenprint Funding Bot
------------------------------
-This bot allows users to subscribe to different tiers of funding arbitrage trading 
-between Hyperliquid and Kraken exchanges, with customizable token selections.
+Telegram Bot that serves as interface to the Crypto Arbitrage Bot
 """
 
 import os
 import logging
 import asyncio
 import json
+import sys
 from datetime import datetime, timedelta
 from typing import List, Dict, Set, Any
 from telegram import (
@@ -18,7 +16,8 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
+    Bot
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -30,8 +29,10 @@ from telegram.ext import (
     ConversationHandler,
     filters
 )
+from telegram.error import TelegramError, Conflict
 from dotenv import load_dotenv
 import time
+from aiohttp import web
 
 from database import Database, User, APIKey, BotStatus, Transaction, TokenSelection
 from security import SecurityManager
@@ -116,7 +117,7 @@ class AbraxasGreenprintBot:
         self.webhook_url = os.getenv('WEBHOOK_URL', 'https://your-domain.com/webhook')
         self.webhook_port = int(os.getenv('WEBHOOK_PORT', '8443'))
         self.webhook_path = f"/webhook/{token}"  # Unique path per bot instance
-        
+
     def setup_handlers(self):
         """Setup handlers for commands and callbacks"""
         logger.info("Setting up message handlers")
@@ -138,7 +139,6 @@ class AbraxasGreenprintBot:
         subscribe_conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("subscribe", self.cmd_subscribe),
-                CallbackQueryHandler(self.subscription_extend_callback, pattern="^subscribe_extend$"),
                 CallbackQueryHandler(self.choose_tier_callback, pattern=r"^tier_\d$")
             ],
             states={
@@ -172,16 +172,11 @@ class AbraxasGreenprintBot:
         )
         self.application.add_handler(subscribe_conv_handler)
         
-        # Remove the separate subscription extension handler since it's now part of the conversation
-        # self.application.add_handler(CallbackQueryHandler(self.subscription_extend_callback, pattern="^subscribe_extend$"))
-        self.application.add_handler(CallbackQueryHandler(self.cancel_callback, pattern="^cancel$"))
-        
         # Add guided setup handlers - integrated with the strategy selection flow
         tokens_conv_handler = ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(self.guide_tokens_callback, pattern="^guide_tokens$"),
-                CallbackQueryHandler(self.guide_strategies_callback, pattern="^guide_strategies$"),
-                CommandHandler("tokens", self.cmd_tokens)
+                CommandHandler("tokens", self.cmd_tokens),
+                CallbackQueryHandler(self.guide_tokens_callback, pattern="^guide_tokens$")
             ],
             states={
                 CHOOSING_TOKENS: [
@@ -217,7 +212,7 @@ class AbraxasGreenprintBot:
                 AWAITING_KRAKEN_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_kraken_secret)],
                 AWAITING_HL_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_hl_key)],
                 AWAITING_HL_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_hl_secret)],
-                AWAITING_HL_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_hl_wallet)] # Add handler for new state
+                AWAITING_HL_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_hl_wallet)]
             },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)]
         )
@@ -946,7 +941,7 @@ class AbraxasGreenprintBot:
                 ])
         
         token_buttons.append([
-            InlineKeyboardButton("Save Selections", callback_data="save_tokens")
+            InlineKeyboardButton("Confirm Token Selection", callback_data="save_tokens")
         ])
         
         # Store current tokens in context
@@ -958,7 +953,7 @@ class AbraxasGreenprintBot:
         message_text = (
             f"*Token Selection*\n\n"
             f"Your subscription (Tier {user.subscription_tier}) allows you to select "
-            f"up to {max_tokens} tokens.\n\n"
+            f"{'1 token' if user.subscription_tier == 1 else '2 tokens' if user.subscription_tier == 2 else 'all available tokens'}.\n\n"
             f"*Current selections:* {current_text}\n"
             f"({len(current_tokens)}/{max_tokens})\n\n"
             f"Tap on tokens to select or deselect them. There are {len(self.available_pairs)} tokens available:"
@@ -985,122 +980,163 @@ class AbraxasGreenprintBot:
     async def manage_tokens_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle token management callbacks"""
         query = update.callback_query
+        user_id = query.from_user.id
+
+        logger.info(f"Starting token management for user {user_id}")
+        logger.info(f"Callback data: {query.data}")
         await query.answer()
         
-        user_id = query.from_user.id
-        user = self.db.get_user_by_telegram_id(user_id)
-        
-        if not user:
-            await query.edit_message_text("User not found. Please use /start to register.")
-            return ConversationHandler.END
-            
-        max_tokens = self.token_limits[user.subscription_tier]
-        
-        if query.data == "save_tokens":
-            # Save the current token selections
-            if 'current_tokens' in context.user_data:
-                tokens = context.user_data['current_tokens']
-                success = self.db.update_user_tokens(user_id, tokens)
-                
-                if success:
-                    # Store selected tokens for use in the strategy selection
-                    context.user_data['selected_tokens'] = tokens.copy()
-                    
-                    # Transition to entry strategy selection instead of ending conversation
-                    await query.edit_message_text(
-                        f"✅ Your token selections have been saved: *{', '.join(tokens) if tokens else 'None'}*\n\n"
-                        f"Now, let's configure your *trading strategies*.\n\n"
-                        f"Choose your *entry strategy*:",
-                        parse_mode='Markdown',
-                        reply_markup=self.get_entry_strategy_keyboard()
-                    )
-                    
-                    return CHOOSING_ENTRY_STRATEGY
-                else:
-                    await query.edit_message_text(
-                        "❌ There was a problem saving your token selections. Please try again."
-                    )
-                    
-                    # Clear token selection state
-                    if 'current_tokens' in context.user_data:
-                        del context.user_data['current_tokens']
-                    if 'in_token_selection' in context.user_data:  
-                        del context.user_data['in_token_selection']
-                        
-                    return ConversationHandler.END
-            else:
-                await query.edit_message_text(
-                    "⚠️ No token selections found. Please try again."
-                )
+        try:
+            # Get user from database
+            user = self.db.get_user_by_telegram_id(user_id)
+            if not user:
+                logger.warning(f"User {user_id} not found in database during token management")
+                await query.edit_message_text("User not found. Please use /start to register.")
                 return ConversationHandler.END
             
-        elif query.data.startswith("toggle_"):
-            # Toggle a token selection
-            token = query.data.split("_")[1]
-            
-            if 'current_tokens' not in context.user_data:
-                context.user_data['current_tokens'] = []
+            logger.info(f"Found user {user_id} with tier {user.subscription_tier}")
+
+            max_tokens = self.token_limits[user.subscription_tier]
+            logger.info(f"User {user_id} has token limit of {max_tokens} for tier {user.subscription_tier}")
+        
+            if query.data == "save_tokens":
+                logger.info(f"User {user_id} attempting to save token selections")
+                # Save the current token selections
+                if 'current_tokens' in context.user_data:
+                    tokens = context.user_data['current_tokens']
+                    logger.info(f"User {user_id} selected tokens: {tokens}")
+
+                    # Validate token count against tier limit
+                    if len(tokens) > max_tokens:
+                        logger.warning(f"User {user_id} attempted to save {len(tokens)} tokens, exceeding limit of {max_tokens}")
+                        await query.edit_message_text(
+                            f"❌ You can only select {max_tokens} token{'s' if max_tokens > 1 else ''} for Tier {user.subscription_tier}.\n"
+                            "Please deselect some tokens and try again."
+                        )
+                        return CHOOSING_TOKENS
+
+                    success = self.db.update_user_tokens(user_id, tokens)
+                    logger.info(f"Token update for user {user_id} {'succeeded' if success else 'failed'}")
                 
-            current_tokens = context.user_data['current_tokens']
-            
-            # Toggle the token
-            if token in current_tokens:
-                current_tokens.remove(token)
-            else:
-                # Check if max tokens reached
-                if len(current_tokens) >= max_tokens:
-                    await query.answer(f"Maximum {max_tokens} tokens for Tier {user.subscription_tier}. Deselect a token first.")
-                    return CHOOSING_TOKENS
+                    if success:
+                        # Store selected tokens for use in the strategy selection
+                        context.user_data['selected_tokens'] = tokens.copy()
+                        logger.info(f"Stored {len(tokens)} tokens in context for user {user_id}")
                     
-                current_tokens.append(token)
-                
-            # Update UI
-            token_buttons = []
-            for available_token in self.available_pairs:
-                if available_token in current_tokens:
-                    token_buttons.append([
-                        InlineKeyboardButton(f"✅ {available_token}", callback_data=f"toggle_{available_token}")
-                    ])
+                        # Show confirmation message
+                        await query.edit_message_text(
+                            f"✅ *Token Selection Confirmed!*\n\n"
+                            f"*Selected Tokens:* {', '.join(tokens) if tokens else 'None'}\n\n"
+                            f"Now, let's configure your *trading strategies*.\n\n"
+                            f"Choose your *entry strategy*:",
+                            parse_mode='Markdown',
+                            reply_markup=self.get_entry_strategy_keyboard()
+                        )
+                        logger.info(f"Transitioning user {user_id} to strategy selection")
+                        return CHOOSING_ENTRY_STRATEGY
+                    else:
+                        logger.error(f"Failed to update tokens in database for user {user_id}")
+                        await query.edit_message_text(
+                            "❌ There was a problem saving your token selections. Please try again."
+                        )
+                    
+                        # Clear token selection state
+                        if 'current_tokens' in context.user_data:
+                            del context.user_data['current_tokens']
+                        if 'in_token_selection' in context.user_data:  
+                            del context.user_data['in_token_selection']
+                        
+                        return ConversationHandler.END
                 else:
-                    token_buttons.append([
-                        InlineKeyboardButton(available_token, callback_data=f"toggle_{available_token}")
-                    ])
+                    logger.warning(f"No token selections found in context for user {user_id}")
+                    await query.edit_message_text(
+                        "⚠️ No token selections found. Please try again."
+                    )
+                    return ConversationHandler.END
+            
+            elif query.data.startswith("toggle_"):
+                # Toggle a token selection
+                token = query.data.split("_")[1]
+                logger.info(f"User {user_id} toggling token: {token}")
+            
+                if 'current_tokens' not in context.user_data:
+                    context.user_data['current_tokens'] = []
+                    logger.info(f"Initialized empty token selection for user {user_id}")
+                
+                current_tokens = context.user_data['current_tokens']
+            
+                # Toggle the token
+                if token in current_tokens:
+                    current_tokens.remove(token)
+                    logger.info(f"User {user_id} removed token: {token}")
+                else:
+                    # Check if max tokens reached
+                    if len(current_tokens) >= max_tokens:
+                        logger.warning(f"User {user_id} attempted to exceed token limit of {max_tokens}")
+                        await query.answer(f"Maximum {max_tokens} tokens for Tier {user.subscription_tier}. Deselect a token first.")
+                        return CHOOSING_TOKENS
                     
-            token_buttons.append([
-                InlineKeyboardButton("Save Selections", callback_data="save_tokens")
-            ])
+                    current_tokens.append(token)
+                    logger.info(f"User {user_id} added token: {token}")
+                
+                # Update UI
+                token_buttons = []
+                for available_token in self.available_pairs:
+                    if available_token in current_tokens:
+                        token_buttons.append([
+                            InlineKeyboardButton(f"✅ {available_token}", callback_data=f"toggle_{available_token}")
+                        ])
+                    else:
+                        token_buttons.append([
+                            InlineKeyboardButton(available_token, callback_data=f"toggle_{available_token}")
+                        ])
+                    
+                token_buttons.append([
+                    InlineKeyboardButton("Confirm Token Selection", callback_data="save_tokens")
+                ])
             
-            # Format current selections text
-            current_text = ", ".join(current_tokens) if current_tokens else "None"
+                # Format current selections text
+                current_text = ", ".join(current_tokens) if current_tokens else "None"
             
+                try:
+                    await query.edit_message_text(
+                        f"*Token Selection*\n\n"
+                        f"Your subscription (Tier {user.subscription_tier}) allows you to select "
+                        f"{'1 token' if user.subscription_tier == 1 else '2 tokens' if user.subscription_tier == 2 else 'all available tokens'}.\n\n"
+                        f"*Current selections:* {current_text}\n"
+                        f"({len(current_tokens)}/{max_tokens})\n\n"
+                        f"Tap on tokens to select or deselect them. There are {len(self.available_pairs)} tokens available:",
+                        parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup(token_buttons)
+                    )
+                    logger.info(f"Successfully updated token selection UI for user {user_id}")
+                except Exception as edit_error:
+                    logger.error(f"Failed to edit message for user {user_id}: {str(edit_error)}")
+                    # If editing fails, send a new message
+                    await query.message.reply_text(
+                        f"*Token Selection*\n\n"
+                        f"Your subscription (Tier {user.subscription_tier}) allows you to select "
+                        f"{'1 token' if user.subscription_tier == 1 else '2 tokens' if user.subscription_tier == 2 else 'all available tokens'}.\n\n"
+                        f"*Current selections:* {current_text}\n"
+                        f"({len(current_tokens)}/{max_tokens})\n\n"
+                        f"Tap on tokens to select or deselect them. There are {len(self.available_pairs)} tokens available:",
+                        parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup(token_buttons)
+                    )
+                    logger.info(f"Sent new message to user {user_id} after edit failed")
+                
+                return CHOOSING_TOKENS
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in manage_tokens_callback for user {user_id}: {str(e)}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
             try:
                 await query.edit_message_text(
-                    f"*Token Selection*\n\n"
-                    f"Your subscription (Tier {user.subscription_tier}) allows you to select "
-                    f"up to {max_tokens} tokens.\n\n"
-                    f"*Current selections:* {current_text}\n"
-                    f"({len(current_tokens)}/{max_tokens})\n\n"
-                    f"Tap on tokens to select or deselect them. There are {len(self.available_pairs)} tokens available:",
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(token_buttons)
+                    "❌ An error occurred while managing token selections. Please try again."
                 )
-            except Exception as e:
-                logger.error(f"Error updating token selection message: {str(e)}")
-                # If we can't edit the message, send a new one
-                await query.message.reply_text(
-                    f"*Token Selection*\n\n"
-                    f"Your subscription (Tier {user.subscription_tier}) allows you to select "
-                    f"up to {max_tokens} tokens.\n\n"
-                    f"*Current selections:* {current_text}\n"
-                    f"({len(current_tokens)}/{max_tokens})\n\n"
-                    f"Tap on tokens to select or deselect them. There are {len(self.available_pairs)} tokens available:",
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(token_buttons)
-                )
-                
-            return CHOOSING_TOKENS
-            
-        return CHOOSING_TOKENS
+            except:
+                pass
+            return ConversationHandler.END
         
     async def cmd_setkeys(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the /setkeys command"""
@@ -1349,7 +1385,6 @@ class AbraxasGreenprintBot:
                     logger.error(f"Error encrypting/storing Hyperliquid API keys for user {user_id}: {str(e)}")
 
             # Store Hyperliquid Wallet Address in DB
-            # !!! IMPORTANT: Assumes a method like store_hyperliquid_wallet exists in database.py !!!
             try:
                 logger.info(f"Storing Hyperliquid wallet address for user {user_id}")
                 # You might need to adapt this call based on your actual database method signature
@@ -1370,7 +1405,6 @@ class AbraxasGreenprintBot:
                 logger.info(f"Hyperliquid wallet storage {'successful' if hl_wallet_success else 'failed'} for user {user_id}")
             except Exception as e:
                 logger.error(f"Error storing Hyperliquid wallet for user {user_id}: {str(e)}")
-
 
             # Clear sensitive data from context for security
             logger.info(f"Clearing sensitive data from context for user {user_id}")
@@ -1668,7 +1702,7 @@ class AbraxasGreenprintBot:
         balances_text = "No balance data available"
         funding_rates_text = "No funding rate data available"
         strategies_text = "No strategy data available"
-        
+
         if bot_status and bot_status.is_running:
             bot_info = self.bot_service.get_bot_status(str(user_id))
             if bot_info:
@@ -1677,7 +1711,7 @@ class AbraxasGreenprintBot:
                     positions_text = ""
                     for asset, pos in bot_info['positions'].items():
                         positions_text += f"\n{asset}: HL={pos['hl_position']}, Kraken={pos['kraken_position']}"
-                
+                    
                 # Format balances
                 if 'balances' in bot_info and bot_info['balances']:
                     balances_text = ""
@@ -1686,7 +1720,7 @@ class AbraxasGreenprintBot:
                             balances_text += f"\n{exchange}: ${balance:.2f}"
                         else:
                             balances_text += f"\n{exchange}: {balance}"
-                
+
                 # Format funding rates
                 if 'funding_rates' in bot_info and bot_info['funding_rates']:
                     funding_rates_text = ""
@@ -1695,11 +1729,11 @@ class AbraxasGreenprintBot:
                             funding_rates_text += f"\n{asset}: {rate:.4f}%"
                         else:
                             funding_rates_text += f"\n{asset}: {rate}"
-                
+
                 # Format strategies
                 if 'strategies' in bot_info:
                     strategies_text = f"Entry: {bot_info['strategies'].get('entry_strategy', 'default')}, Exit: {bot_info['strategies'].get('exit_strategy', 'default')}"
-                    
+
         # Format status message
         status_message = (
             "📊 *Abraxas Greenprint Status*\n\n"
@@ -1765,17 +1799,18 @@ class AbraxasGreenprintBot:
                 return
             
             # Check if payment is already confirmed
-            if transaction_data['status'] == 'completed':
+            if transaction_data.payment_status == 'completed':
                 self.logger.info(f"Payment {payment_id} already confirmed")
                 return
             
-            # Get payment data
-            payment_data = json.loads(transaction_data['payment_data'])
-            tier = transaction_data['tier']
+            # Get payment data and tier
+            payment_data = json.loads(transaction_data.payment_data) if transaction_data.payment_data else {}
+            tier = transaction_data.tier
+            self.logger.info(f"Processing payment for tier {tier}")
             
             # First, quickly check if webhook has already confirmed the payment
             transaction_data = self.db.get_transaction(payment_id)
-            if transaction_data['status'] == 'completed':
+            if transaction_data.payment_status == 'completed':
                 # Payment already confirmed via webhook!
                 self.logger.info(f"Payment {payment_id} already confirmed via webhook")
                 await self._send_confirmation_and_setup_keys(user_id, payment_id, tier)
@@ -1791,9 +1826,15 @@ class AbraxasGreenprintBot:
                 # Check payment status in our database (may have been updated by webhook)
                 transaction_data = self.db.get_transaction(payment_id)
                 
-                if transaction_data['status'] == 'completed':
+                if transaction_data.payment_status == 'completed':
                     # Payment confirmed via webhook!
                     self.logger.info(f"Payment {payment_id} confirmed via webhook on attempt {attempt+1}")
+
+                    # Double check the tier
+                    if transaction_data.tier != tier:
+                        self.logger.warning(f"Tier mismatch! Expected {tier}, got {transaction_data.tier}")
+                        tier = transaction_data.tier
+
                     await self._send_confirmation_and_setup_keys(user_id, payment_id, tier)
                     return
                 
@@ -1805,6 +1846,12 @@ class AbraxasGreenprintBot:
                         # Update transaction status
                         self.db.update_transaction_status(payment_id, 'completed')
                         
+                        # Verify the tier one more time
+                        transaction_data = self.db.get_transaction(payment_id)
+                        if transaction_data.tier != tier:
+                            self.logger.warning(f"Tier mismatch! Expected {tier}, got {transaction_data.tier}")
+                            tier = transaction_data.tier
+
                         await self._send_confirmation_and_setup_keys(user_id, payment_id, tier)
                         return
                 
@@ -1825,6 +1872,12 @@ class AbraxasGreenprintBot:
                 # Update transaction status
                 self.db.update_transaction_status(payment_id, 'completed')
                 
+                # Final tier verification
+                transaction_data = self.db.get_transaction(payment_id)
+                if transaction_data.tier != tier:
+                    self.logger.warning(f"Tier mismatch! Expected {tier}, got {transaction_data.tier}")
+                    tier = transaction_data.tier
+
                 await self._send_confirmation_and_setup_keys(user_id, payment_id, tier)
             else:
                 # Payment not confirmed after all attempts
@@ -1852,267 +1905,284 @@ class AbraxasGreenprintBot:
     async def _send_confirmation_and_setup_keys(self, user_id, payment_id, tier):
         """Helper method to send payment confirmation and start API key setup"""
         try:
+            logger.info(f"Processing payment confirmation for user {user_id}, payment {payment_id}, tier {tier}")
+
             # Update subscription
             from datetime import datetime, timedelta
-            self.db.update_user_subscription(
+            expiry_date = datetime.now() + timedelta(days=30)
+            logger.info(f"Updating user {user_id} subscription to tier {tier} with expiry {expiry_date}")
+
+            # Update subscription and verify the update
+            success = self.db.update_user_subscription(
                 telegram_id=user_id,
                 tier=tier,
-                expiry=datetime.now() + timedelta(days=30)
+                expiry=expiry_date
             )
-            
-            # Send confirmation to user
-            await self.application.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ *Payment Confirmed Successfully!* Your Tier {tier} subscription is now active.\n\n"
-                      f"🔐 *Next Step: Set up your API keys*\n\n"
-                      f"To start trading, we need your exchange API keys. Please enter your Kraken API Key now:",
-                parse_mode='Markdown'
-            )
-            
-            # Start the API key setup conversation
-            await self._start_key_setup_conversation(user_id)
-            
+
+            if not success:
+                logger.error(f"Failed to update subscription for user {user_id} to tier {tier}")
+                raise Exception("Failed to update subscription in database")
+
+            # Verify the update with multiple retries
+            max_retries = 3
+            retry_delay = 1  # seconds
+
+            for attempt in range(max_retries):
+                user = self.db.get_user_by_telegram_id(user_id)
+                if user and user.subscription_tier == tier:
+                    logger.info(f"Subscription verified for user {user_id} on attempt {attempt + 1}")
+                    break
+
+                if attempt < max_retries - 1:
+                    logger.warning(f"Subscription verification failed on attempt {attempt + 1}, retrying...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error(f"Subscription verification failed after {max_retries} attempts")
+                    raise Exception("Subscription verification failed")
+
+            logger.info(f"Successfully updated and verified subscription for user {user_id} to tier {tier}")
+
+            # Send confirmation to user with tier-specific message
+            token_limit = "1 token" if tier == 1 else "2 tokens" if tier == 2 else "all available tokens"
+            logger.info(f"Sending confirmation message to user {user_id} for tier {tier} with token limit {token_limit}")
+
+            try:
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text=f"✅ *Payment Confirmed Successfully!* Your Tier {tier} subscription is now active.\n\n"
+                          f"Your subscription allows you to select {token_limit} for trading.\n\n"
+                          f"🔐 *Next Step: Select your trading tokens*\n\n"
+                          f"Please use the button below to select your tokens:",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Select Tokens", callback_data="guide_tokens")]
+                    ])
+                )
+                logger.info(f"Sent confirmation message to user {user_id}")
+            except Exception as msg_error:
+                logger.error(f"Failed to send confirmation message: {str(msg_error)}")
+                logger.error(f"Error in _send_confirmation_and_setup_keys for user {user_id}: {str(msg_error)}")
+                logger.error(f"Payment ID: {payment_id}, Tier: {tier}")
+                # Try sending a simpler message without markdown or buttons
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=user_id,
+                        text=f"✅ Your payment has been confirmed! Your Tier {tier} subscription is now active.\n\n"
+                              "Please use /tokens to select your trading tokens."
+                        )
+                except Exception as fallback_error:
+                    logger.error(f"Failed to send fallback message to user {user_id}: {str(fallback_error)}")
+
         except Exception as e:
-            self.logger.error(f"Error sending confirmation and setting up keys: {str(e)}")
+            logger.error(f"Error in _send_confirmation_and_setup_keys for user {user_id}: {str(e)}")
+            logger.error(f"Payment ID: {payment_id}, Tier: {tier}")
             # Send a fallback message
             try:
                 await self.application.bot.send_message(
                     chat_id=user_id,
                     text=f"✅ Your payment has been confirmed! Your Tier {tier} subscription is now active.\n\n"
-                          "Please use /setkeys to set up your exchange API keys."
+                          "Please use /tokens to select your trading tokens."
                 )
-            except:
-                pass
-        
-    async def _start_key_setup_conversation(self, user_id):
-        """Helper method to start the API key setup conversation"""
-        try:
-            # Create a new conversation context for this user
-            chat_data = {}
-            user_data = {}
-            
-            # Simulate the /setkeys command in a new conversation
-            await self.cmd_setkeys(
-                Update(
-                    update_id=0,
-                    message=Message(
-                        message_id=0,
-                        date=datetime.now(),
-                        chat=Chat(id=user_id, type="private"),
-                        from_user=User(id=user_id, is_bot=False, first_name="User"),
-                        text="/setkeys"
-                    )
-                ),
-                ContextTypes.DEFAULT_TYPE.from_dict({
-                    'chat_data': chat_data,
-                    'user_data': user_data
-                })
-            )
-            
-            self.logger.info(f"Started API key setup conversation for user {user_id}")
-        except Exception as e:
-            self.logger.error(f"Error starting key setup conversation: {str(e)}")
-            # Fallback to manual command
-            await self.application.bot.send_message(
-                chat_id=user_id,
-                text="To set up your API keys, please use the /setkeys command."
-            )
-        
-    async def subscription_extend_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle subscription extension callback"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        
-        await query.answer()
-        
-        # Check if this is a tier selection from extension flow
-        if query.data.startswith("tier_"):
-            # Process tier selection
-            selected_tier = int(query.data.split("_")[1])
-            
-            # Store selected tier in context
-            context.user_data['selected_tier'] = selected_tier
-            
-            # Initialize payment_data if not exists
-            if 'payment_data' not in context.user_data:
-                context.user_data['payment_data'] = {}
-            
-            context.user_data['payment_data']['tier'] = selected_tier
-            
-            # Get user's email from database
-            user = self.db.get_user_by_telegram_id(user_id)
-            existing_email = user.email if user and user.email else ""
-            
-            # Set up for payment by asking for email confirmation
-            email_prompt = (
-                f"You've selected Tier {selected_tier} for your subscription extension.\n\n"
-            )
-            
-            if existing_email:
-                email_prompt += (
-                    f"We have your email on file as: {existing_email}\n\n"
-                    f"Please confirm this email address is correct by typing it again, "
-                    f"or enter a new email address:"
-                )
-            else:
-                email_prompt += (
-                    f"Before proceeding with payment, we need your email address to associate with your subscription.\n\n"
-                    f"Please enter your email address:"
-                )
-            
-            await query.edit_message_text(email_prompt)
-            
-            # This starts the email entry conversation
-            return PAYMENT_EMAIL_ENTRY
-            
-        # Get the user's current subscription
-        user = self.db.get_user_by_telegram_id(user_id)
-        if not user or not user.subscription_tier:
-            await query.edit_message_text(
-                "Error: Subscription information not found. Please use /subscribe to start a new subscription."
-            )
-            return ConversationHandler.END
-        
-        current_tier = user.subscription_tier
-        
-        # Prepare tier options with correct pricing
-        keyboard = []
-        
-        # Keep current tier option
-        tier_prices = {1: 50, 2: 100, 3: 200}
-        keyboard.append([InlineKeyboardButton(
-            f"Keep Tier {current_tier} (${tier_prices[current_tier]}/month)", 
-            callback_data=f"tier_{current_tier}"
-        )])
-        
-        # Add upgrade/downgrade options
-        if current_tier == 1:
-            keyboard.append([InlineKeyboardButton("Upgrade to Tier 2 ($100/month)", callback_data="tier_2")])
-            keyboard.append([InlineKeyboardButton("Upgrade to Tier 3 ($200/month)", callback_data="tier_3")])
-        elif current_tier == 2:
-            keyboard.append([InlineKeyboardButton("Downgrade to Tier 1 ($50/month)", callback_data="tier_1")])
-            keyboard.append([InlineKeyboardButton("Upgrade to Tier 3 ($200/month)", callback_data="tier_3")])
-        elif current_tier == 3:
-            keyboard.append([InlineKeyboardButton("Downgrade to Tier 1 ($50/month)", callback_data="tier_1")])
-            keyboard.append([InlineKeyboardButton("Downgrade to Tier 2 ($100/month)", callback_data="tier_2")])
-        
-        await query.edit_message_text(
-            f"You currently have a Tier {current_tier} subscription.\n\n"
-            f"Please select the tier you'd like to extend with:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
-        # Make sure we're using the subscription conversation
-        logger.info(f"User {user_id} is selecting a tier for subscription extension")
-        return CHOOSING_TIER
-        
-    async def cancel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle cancel callback"""
-        query = update.callback_query
-        await query.answer()
-        
-        await query.edit_message_text(
-            "Operation cancelled. Your subscription remains unchanged."
-        )
+            except Exception as fallback_error:
+                logger.error(f"Failed to send fallback message to user {user_id}: {str(fallback_error)}")
         
     async def guide_tokens_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle guided token setup button from webhook notification"""
         query = update.callback_query
-        await query.answer()
-        
         user_id = update.effective_user.id
+
+        logger.info(f"Starting token selection for user {user_id}")
+        await query.answer()
         
         # End any existing conversations to avoid state conflicts
         context.user_data.clear()
-        
-        # Send a temporary confirmation message
-        message = await query.edit_message_text("Taking you to token selection...")
-        
-        # Now create a new message with token selection options - this is better than
-        # directly calling cmd_tokens which might have conversation state issues
-        user = self.db.get_user_by_telegram_id(user_id)
-        if not user:
-            await message.reply_text("Please use /start to register first.")
-            return ConversationHandler.END
-            
-        # Check if user has an active subscription
-        if not user.subscription_tier or not user.subscription_expiry or user.subscription_expiry < datetime.now():
-            await message.reply_text("You don't have an active subscription. Please subscribe first with /subscribe")
-            return ConversationHandler.END
-            
-        # Get current token selections
-        current_tokens = self.db.get_user_tokens(user_id)
-        max_tokens = self.token_limits[user.subscription_tier]
-        
-        # Refresh available pairs
-        self.available_pairs = get_active_trading_pairs()
-        
-        # Create token selection UI
-        token_buttons = []
-        for token in self.available_pairs:
-            if token in current_tokens:
-                token_buttons.append([
-                    InlineKeyboardButton(f"✅ {token}", callback_data=f"toggle_{token}")
-                ])
-            else:
-                token_buttons.append([
-                    InlineKeyboardButton(token, callback_data=f"toggle_{token}")
-                ])
-        
-        token_buttons.append([
-            InlineKeyboardButton("Save Selections", callback_data="save_tokens")
-        ])
-        
-        # Store current tokens in context
-        context.user_data['current_tokens'] = current_tokens.copy()
-        context.user_data['in_token_selection'] = True  # Flag to track state
-        
-        # Format current selections text
-        current_text = ", ".join(current_tokens) if current_tokens else "None"
-        
-        message_text = (
-            f"*Token Selection*\n\n"
-            f"Your subscription (Tier {user.subscription_tier}) allows you to select "
-            f"up to {max_tokens} tokens.\n\n"
-            f"*Current selections:* {current_text}\n"
-            f"({len(current_tokens)}/{max_tokens})\n\n"
-            f"Tap on tokens to select or deselect them. There are {len(self.available_pairs)} tokens available:"
-        )
-        
-        await message.reply_text(
-            message_text,
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(token_buttons)
-        )
-        
-        return CHOOSING_TOKENS
-        
-    async def guide_keys_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle guided API keys setup button from webhook notification"""
+        logger.info(f"Cleared user context for {user_id}")
+
         try:
-            query = update.callback_query
-            await query.answer()
+            # Get user from database with retries
+            max_retries = 3
+            retry_delay = 1  # seconds
+            user = None
+
+            for attempt in range(max_retries):
+                user = self.db.get_user_by_telegram_id(user_id)
+                if user and user.subscription_tier:
+                    logger.info(f"Found user {user_id} with tier {user.subscription_tier} on attempt {attempt + 1}")
+                    break
+
+                if attempt < max_retries - 1:
+                    logger.warning(f"User or tier not found on attempt {attempt + 1}, retrying...")
+                    await asyncio.sleep(retry_delay)
+
+            if not user:
+                logger.warning(f"User {user_id} not found in database after {max_retries} attempts")
+                await query.edit_message_text("Please use /start to register first.")
+                return ConversationHandler.END
             
-            user_id = update.effective_user.id
-            logger.info(f"Guided API keys setup started for user {user_id}")
-            
-            # Clear user data to start fresh
-            context.user_data.clear()
-            context.user_data['setting_api_keys'] = True
-            
+            logger.info(f"Found user {user_id} with tier {user.subscription_tier}")
+
             # Check if user has an active subscription
+            if not user.subscription_tier or not user.subscription_expiry or user.subscription_expiry < datetime.now():
+                logger.warning(f"User {user_id} has no active subscription")
+                await query.edit_message_text("You don't have an active subscription. Please subscribe first with /subscribe")
+                return ConversationHandler.END
+            
+            # Get current token selections
+            current_tokens = self.db.get_user_tokens(user_id)
+            max_tokens = self.token_limits[user.subscription_tier]
+            logger.info(f"User {user_id} has {len(current_tokens)}/{max_tokens} tokens selected")
+        
+            # Refresh available pairs
+            self.available_pairs = get_active_trading_pairs()
+            logger.info(f"Found {len(self.available_pairs)} available trading pairs")
+        
+            # Create token selection UI
+            token_buttons = []
+            for token in self.available_pairs:
+                if token in current_tokens:
+                    token_buttons.append([
+                        InlineKeyboardButton(f"✅ {token}", callback_data=f"toggle_{token}")
+                    ])
+                else:
+                    token_buttons.append([
+                        InlineKeyboardButton(token, callback_data=f"toggle_{token}")
+                    ])
+        
+            # Add the Confirm Token Selection button
+            token_buttons.append([
+                InlineKeyboardButton("Confirm Token Selection", callback_data="save_tokens")
+            ])
+        
+            # Store current tokens in context
+            context.user_data['current_tokens'] = current_tokens.copy()
+            context.user_data['in_token_selection'] = True
+            logger.info(f"Stored {len(current_tokens)} tokens in context for user {user_id}")
+        
+            # Format current selections text
+            current_text = ", ".join(current_tokens) if current_tokens else "None"
+
+            # Create tier-specific message
+            token_limit_text = "1 token" if user.subscription_tier == 1 else "2 tokens" if user.subscription_tier == 2 else "all available tokens"
+        
+            message_text = (
+                f"*Token Selection*\n\n"
+                f"Your subscription (Tier {user.subscription_tier}) allows you to select {token_limit_text}.\n\n"
+                f"*Current selections:* {current_text}\n"
+                f"({len(current_tokens)}/{max_tokens})\n\n"
+                f"Tap on tokens to select or deselect them. There are {len(self.available_pairs)} tokens available:"
+            )
+        
+            logger.info(f"Sending token selection interface to user {user_id}")
+            try:
+                # Edit the existing message with the new content and buttons
+                await query.edit_message_text(
+                    message_text,
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(token_buttons)
+                )
+                logger.info(f"Successfully edited message for user {user_id}")
+            except Exception as edit_error:
+                logger.error(f"Failed to edit message for user {user_id}: {str(edit_error)}")
+                # If editing fails, send a new message
+                await query.message.reply_text(
+                    message_text,
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(token_buttons)
+                )
+                logger.info(f"Sent new message to user {user_id} after edit failed")
+        
+            return CHOOSING_TOKENS
+        
+        except Exception as e:
+            logger.error(f"Unexpected error in guide_tokens_callback for user {user_id}: {str(e)}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
+            try:
+                await query.edit_message_text(
+                    "❌ An error occurred while setting up token selection. Please try again."
+                )
+            except:
+                pass
+            return ConversationHandler.END
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle errors in the bot"""
+        try:
+            error = context.error
+            logger.error(f"Exception while handling an update: {error}")
+            logger.error(f"Error type: {type(error).__name__}")
+            logger.error(f"Error details: {str(error)}")
+            
+            if isinstance(error, Conflict):
+                logger.error("Bot conflict detected. Another instance might be running.")
+                # Try to gracefully shut down
+                await self.application.stop()
+                # Exit the program
+                sys.exit(1)
+            else:
+                # Log other errors but don't crash
+                logger.error(f"Non-critical error in update: {error}")
+                logger.error(f"Update details: {update}")
+                logger.error(f"Context details: {context}")
+        except Exception as e:
+            logger.error(f"Error in error handler: {str(e)}")
+    
+    async def delete_webhook(self):
+        """Asynchronously delete any existing webhook."""
+        try:
+            await self.application.bot.delete_webhook()
+            logger.info("Successfully deleted webhook")
+        except TelegramError as e:
+            logger.warning(f"Error deleting webhook: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error deleting webhook: {e}")
+
+    def run(self):
+        """Start the bot in polling mode."""
+        try:
+            # Delete any existing webhook
+            asyncio.get_event_loop().run_until_complete(self.delete_webhook())
+            
+            # Start polling
+            logger.info("Starting bot in polling mode...")
+            self.application.run_polling()
+            
+        except Exception as e:
+            if isinstance(e, Conflict):
+                logger.error(f"Bot conflict detected: {e}")
+                logger.error("Another instance might be running. Use cleanup_bot.py to terminate existing instances.")
+            else:
+                logger.error(f"Failed to start polling: {str(e)}")
+            sys.exit(1)
+
+    async def guide_keys_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle guided API key setup button"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        logger.info(f"Starting API key setup for user {user_id}")
+        await query.answer()
+        
+        # End any existing conversations to avoid state conflicts
+        context.user_data.clear()
+        logger.info(f"Cleared user context for {user_id}")
+        
+        try:
+            # Get user from database
             user = self.db.get_user_by_telegram_id(user_id)
             if not user:
                 logger.warning(f"User {user_id} not found in database")
                 await query.edit_message_text("Please use /start to register first.")
                 return ConversationHandler.END
                 
+            logger.info(f"Found user {user_id} with tier {user.subscription_tier}")
+
+            # Check if user has an active subscription
             if not user.subscription_tier or not user.subscription_expiry or user.subscription_expiry < datetime.now():
-                logger.warning(f"User {user_id} does not have an active subscription")
+                logger.warning(f"User {user_id} has no active subscription")
                 await query.edit_message_text("You don't have an active subscription. Please subscribe first with /subscribe")
                 return ConversationHandler.END
             
-            # Start collecting API keys - directly edit the current message
+            # Start API key setup
             await query.edit_message_text(
                 "🔑 Let's set up your API keys.\n\n"
                 "⚠️ *IMPORTANT*: Never share your API keys with anyone else!\n\n"
@@ -2120,120 +2190,111 @@ class AbraxasGreenprintBot:
                 parse_mode='Markdown'
             )
             
-            logger.info(f"Entering AWAITING_KRAKEN_KEY state for user {user_id}")
             return AWAITING_KRAKEN_KEY
+
         except Exception as e:
-            logger.error(f"Error in guide_keys_callback: {str(e)}")
-            await update.callback_query.edit_message_text(
-                "❌ There was an error setting up API keys. Please try again with /setkeys"
-            )
-            return ConversationHandler.END
-    
-    async def guide_strategies_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Guide the user through selecting entry and exit strategies"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        
-        try:
-            logger.info(f"User {user_id} starting guided strategy setup")
-            
-            await query.answer()
-            
-            # Get the user from database
-            user = self.db.get_user_by_telegram_id(user_id)
-            if not user:
-                logger.warning(f"User {user_id} not found in database for strategy setup")
-                await query.edit_message_text(
-                    "⚠️ User not found. Please use /start to register first."
-                )
-                return ConversationHandler.END
-                
-            # Check if user has an active subscription
-            if not user.subscription_tier or not user.subscription_expiry or user.subscription_expiry < datetime.now():
-                logger.warning(f"User {user_id} has no active subscription for strategy setup")
-                await query.edit_message_text(
-                    "⚠️ You don't have an active subscription. Please subscribe first with /subscribe"
-                )
-                return ConversationHandler.END
-                
-            # Get user's current tokens or guide them to select tokens first
-            user_tokens = self.db.get_user_tokens(user_id)
-            if not user_tokens:
-                logger.warning(f"User {user_id} has no tokens selected for strategy setup")
-                await query.edit_message_text(
-                    "You need to select which tokens to trade before setting strategies.\n\n"
-                    "Please use the button below to select your trading tokens first:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Select Tokens", callback_data="guide_tokens")]
-                    ])
-                )
-                return ConversationHandler.END
-                
-            # Display entry strategy selection
-            await query.edit_message_text(
-                "Let's configure your trading strategies.\n\n"
-                f"You're currently trading: *{', '.join(user_tokens)}*\n\n"
-                "First, choose your *entry strategy*:\n"
-                "(When to enter a position)",
-                parse_mode="Markdown",
-                reply_markup=self.get_entry_strategy_keyboard()
-            )
-            
-            # Store selected tokens in context for later use
-            context.user_data['selected_tokens'] = user_tokens
-            
-            return CHOOSING_ENTRY_STRATEGY
-        except Exception as e:
-            logger.error(f"Error in guide_strategies_callback: {str(e)}")
-            await query.edit_message_text(
-                "Sorry, an error occurred while setting up strategies. Please try again later."
-            )
-            return ConversationHandler.END
-    
-    def run(self):
-        """Start the bot with polling"""
-        logger.info("Starting Abraxas Greenprint Funding Bot with polling")
-        
-        try:
-            # First, try to delete any existing webhook
+            logger.error(f"Unexpected error in guide_keys_callback for user {user_id}: {str(e)}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
             try:
-                self.application.bot.delete_webhook()
-                logger.info("Successfully deleted any existing webhook")
-            except Exception as e:
-                logger.warning(f"Error deleting webhook: {e}")
-            
-            # Add error handler for conflict
-            async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-                logger.error(f"Exception while handling an update: {context.error}")
-                if isinstance(context.error, telegram.error.Conflict):
-                    logger.error("Bot conflict detected. Another instance might be running.")
-                    # Try to gracefully shut down
-                    await self.application.stop()
-                    # Exit the program
-                    import sys
-                    sys.exit(1)
-            
-            # Add the error handler
-            self.application.add_error_handler(error_handler)
-            
-            # Start the bot with polling
-            self.application.run_polling()
-            
-        except telegram.error.Conflict as e:
-            logger.error(f"Bot conflict detected: {e}")
-            logger.error("Another instance of the bot is already running. Please stop it first.")
-            # Exit with error code
-            import sys
-            sys.exit(1)
+                await query.edit_message_text(
+                    "❌ An error occurred while setting up API keys. Please try again."
+                )
+            except:
+                pass
+            return ConversationHandler.END
+    
+    async def handle_webhook(self, request):
+        """Handle incoming webhook updates."""
+        try:
+            # Get the update from the request
+            data = await request.json()
+            logger.info(f"Received webhook update: {data}")
+
+            # Process the update
+            update = Update.de_json(data, self.application.bot)
+            await self.application.process_update(update)
+
+            return web.Response(text="OK")
         except Exception as e:
-            logger.error(f"Unexpected error starting bot: {e}")
-            raise
-        
-if __name__ == '__main__':
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    if not token:
-        print("Error: TELEGRAM_BOT_TOKEN not set in environment variables")
-        exit(1)
-        
-    bot = AbraxasGreenprintBot(token)
-    bot.run()
+            logger.error(f"Error processing webhook update: {str(e)}", exc_info=True)
+            return web.Response(text="Error", status=500)
+
+    async def setup_webhook(self, webhook_url):
+        """Set up webhook for the bot.
+
+        Args:
+            webhook_url: The URL to receive webhook updates
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Delete any existing webhook
+            await self.delete_webhook()
+
+            # Set the new webhook
+            await self.application.bot.set_webhook(url=webhook_url)
+            logger.info(f"Webhook set to {webhook_url}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to set webhook: {e}")
+            return False
+
+if __name__ == "__main__":
+    # Set up logging first
+    logging.basicConfig(
+        filename='/opt/crypto-arb-bot/logs/bot.log',
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
+    )
+    logger = logging.getLogger(__name__)
+
+    try:
+        # Create bot instance
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not bot_token:
+            logger.error("TELEGRAM_BOT_TOKEN environment variable not set")
+            sys.exit(1)
+
+        # Create bot instance
+        bot = AbraxasGreenprintBot(bot_token)
+        logger.info("Bot instance created successfully")
+
+        # Register error handler
+        bot.application.add_error_handler(bot.error_handler)
+        logger.info("Error handler registered")
+
+        # Check if running under Gunicorn
+        if 'gunicorn' in os.environ.get('SERVER_SOFTWARE', ''):
+            # Webhook mode
+            webhook_url = os.getenv('WEBHOOK_URL')
+            if not webhook_url:
+                logger.error("WEBHOOK_URL environment variable not set")
+                sys.exit(1)
+
+            try:
+                # Set up webhook
+                bot.application.bot.set_webhook(webhook_url)
+                logger.info(f"Bot started in webhook mode at {webhook_url}")
+
+                # Create web app
+                app = web.Application()
+                app.router.add_post(f"/{bot_token}", bot.handle_webhook)
+
+                # Export for Gunicorn
+                web_app = app
+            except Exception as e:
+                logger.error(f"Failed to set up webhook: {str(e)}", exc_info=True)
+                sys.exit(1)
+        else:
+            # Polling mode
+            try:
+                logger.info("Bot started in polling mode")
+                bot.run()
+            except Exception as e:
+                logger.error(f"Failed to start polling: {str(e)}", exc_info=True)
+                sys.exit(1)
+    except Exception as e:
+        logger.error(f"Critical error during bot startup: {str(e)}", exc_info=True)
+        sys.exit(1)

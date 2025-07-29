@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 import time
+import subprocess
 
 from arb_bot import Tier1Bot, Tier2Bot, Tier3Bot
 from database import Database
@@ -161,6 +162,28 @@ class BotService:
     def start_bot_instance(self, user_id_str: str) -> bool:
         """Starts or restarts a bot instance for a given user using data from the database."""
         logger.info(f"Attempting to start bot instance for user {user_id_str}...")
+        
+        # First, run cleanup_bot.py to ensure no leftover processes
+        try:
+            logger.info("Running cleanup_bot.py to terminate any existing bot processes...")
+            cleanup_result = subprocess.run(
+                ["python", "cleanup_bot.py"], 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False  # Don't raise exception on non-zero exit
+            )
+            
+            if cleanup_result.returncode == 0:
+                logger.info("Cleanup completed successfully")
+            else:
+                logger.warning(f"Cleanup script returned non-zero exit code: {cleanup_result.returncode}")
+                logger.warning(f"Cleanup output: {cleanup_result.stdout}\n{cleanup_result.stderr}")
+                # Continue anyway, as we want to try starting the bot even if cleanup had issues
+        except Exception as e:
+            logger.error(f"Error running cleanup script: {str(e)}")
+            # Continue with bot startup attempt
+            
         try:
             telegram_id = int(user_id_str)
         except ValueError:
@@ -272,6 +295,8 @@ class BotService:
 
     def stop_bot(self, user_id_str: str) -> bool:
         """Stop bot for the specified user."""
+        success = True
+        
         if user_id_str in self.running_bots:
             logger.info(f"Attempting to stop bot for user {user_id_str}...")
             bot_info = self.running_bots.get(user_id_str)
@@ -280,47 +305,70 @@ class BotService:
                 del self.running_bots[user_id_str]
                 try: self.db.update_bot_status(int(user_id_str), is_running=False, stop_time=datetime.now())
                 except ValueError: pass
-                return True
+                success = True
+            else:
+                bot = bot_info.get('bot')
+                thread = bot_info.get('thread')
 
-            bot = bot_info.get('bot')
-            thread = bot_info.get('thread')
-
-            try:
-                if bot:
-                    logger.info(f"Calling shutdown() for user {user_id_str}'s bot...")
-                    bot.shutdown()
-                else:
-                     logger.warning(f"No bot object found for user {user_id_str} during stop request.")
-
-                if thread and thread.is_alive():
-                    logger.info(f"Waiting for bot thread {user_id_str} to join (timeout=60s)...")
-                    thread.join(timeout=60)
-                    if thread.is_alive():
-                        logger.warning(f"Bot thread for user {user_id_str} did not exit cleanly after 60s.")
+                try:
+                    if bot:
+                        logger.info(f"Calling shutdown() for user {user_id_str}'s bot...")
+                        bot.shutdown()
                     else:
-                         logger.info(f"Bot thread for user {user_id_str} joined successfully.")
-                else:
-                     logger.info(f"Bot thread for user {user_id_str} was not running or already joined.")
+                         logger.warning(f"No bot object found for user {user_id_str} during stop request.")
 
-                del self.running_bots[user_id_str]
-                logger.info(f"Bot instance removed for user {user_id_str}")
-                try: self.db.update_bot_status(int(user_id_str), is_running=False, stop_time=datetime.now())
-                except ValueError: pass
-                return True
-                
-            except Exception as e:
-                logger.exception(f"Error during graceful shutdown for user {user_id_str}: {e}")
-                if user_id_str in self.running_bots:
+                    if thread and thread.is_alive():
+                        logger.info(f"Waiting for bot thread {user_id_str} to join (timeout=60s)...")
+                        thread.join(timeout=60)
+                        if thread.is_alive():
+                            logger.warning(f"Bot thread for user {user_id_str} did not exit cleanly after 60s.")
+                        else:
+                             logger.info(f"Bot thread for user {user_id_str} joined successfully.")
+                    else:
+                         logger.info(f"Bot thread for user {user_id_str} was not running or already joined.")
+
                     del self.running_bots[user_id_str]
-                try: self.db.update_bot_status(int(user_id_str), is_running=False, stop_time=datetime.now())
-                except ValueError: pass
-                return False
+                    logger.info(f"Bot instance removed for user {user_id_str}")
+                    try: self.db.update_bot_status(int(user_id_str), is_running=False, stop_time=datetime.now())
+                    except ValueError: pass
+                    success = True
+                    
+                except Exception as e:
+                    logger.exception(f"Error during graceful shutdown for user {user_id_str}: {e}")
+                    if user_id_str in self.running_bots:
+                        del self.running_bots[user_id_str]
+                    try: self.db.update_bot_status(int(user_id_str), is_running=False, stop_time=datetime.now())
+                    except ValueError: pass
+                    success = False
         else:
             logger.info(f"No bot currently registered as running for user {user_id_str}. Ensuring DB status is updated.")
             try: self.db.update_bot_status(int(user_id_str), is_running=False)
             except ValueError: pass
-            return True
-                
+            success = True
+        
+        # Run cleanup_bot.py to ensure all processes are terminated
+        try:
+            logger.info("Running cleanup_bot.py to terminate any remaining bot processes...")
+            cleanup_result = subprocess.run(
+                ["python", "cleanup_bot.py"], 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False  # Don't raise exception on non-zero exit
+            )
+            
+            if cleanup_result.returncode == 0:
+                logger.info("Cleanup completed successfully")
+            else:
+                logger.warning(f"Cleanup script returned non-zero exit code: {cleanup_result.returncode}")
+                logger.warning(f"Cleanup output: {cleanup_result.stdout}\n{cleanup_result.stderr}")
+                # Return success based on our own stop logic, not the cleanup script
+        except Exception as e:
+            logger.error(f"Error running cleanup script: {str(e)}")
+            # Return success based on our own stop logic, not the cleanup script
+        
+        return success
+
     def get_bot_status(self, user_id_str: str) -> Dict:
         """Get detailed status of a specific bot instance"""
         if user_id_str in self.running_bots:
