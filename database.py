@@ -57,6 +57,7 @@ class TokenSelection(Base):
     user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     token = Column(String, nullable=False)
     active = Column(Boolean, default=True)
+    finalized = Column(Boolean, default=False)  
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
@@ -64,7 +65,8 @@ class TokenSelection(Base):
     user = relationship("User", back_populates="token_selections")
     
     def __repr__(self):
-        return f"<TokenSelection(user_id={self.user_id}, token={self.token}, active={self.active})>"
+        return f"<TokenSelection(user_id={self.user_id}, token={self.token}, active={self.active}, finalized={self.finalized})>"
+
         
 class APIKey(Base):
     """API Key model for storing encrypted API keys"""

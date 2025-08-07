@@ -439,45 +439,58 @@ class AbraxasGreenprintBot:
         
         return CHOOSING_PAYMENT
         
-    async def token_selection_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle token selection callback"""
-        query = update.callback_query
-        await query.answer()
-        
-        # For our updates from the cmd_tokens method, we should use manage_tokens_callback
-        if query.data.startswith("toggle_") or query.data == "save_tokens":
-            return await self.manage_tokens_callback(update, context)
-            
-        # Rest of the existing token_selection_callback implementation for subscription flow
-        user_id = query.from_user.id
-        selected_tier = context.user_data.get('selected_tier', 1)
-        max_tokens = self.token_limits[selected_tier]
-        
-        if 'selected_tokens' not in context.user_data:
-            context.user_data['selected_tokens'] = []
-            
-        if query.data == "tokens_done":
-            # User is done selecting tokens
-            if not context.user_data['selected_tokens']:
-                # No tokens selected, ask user to select at least one
-                await query.edit_message_text(
-                    "Please select at least one token before proceeding.",
-                    reply_markup=query.message.reply_markup
-                )
-                return CHOOSING_TOKENS
-                
-            # Format the selected tokens for display
-            tokens_text = ", ".join(context.user_data['selected_tokens'])
-            
-            # Move to entry strategy selection instead of payment
+   async def token_selection_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle token selection callback"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    # 🔒 Check if tokens are already finalized for this user
+    existing_selection = self.db.get_token_selection(user_id)
+    if existing_selection and getattr(existing_selection, "finalized", False):
+        await query.edit_message_text(
+            "✅ You have already selected your tokens. This selection is locked and cannot be changed."
+        )
+        return ConversationHandler.END
+
+    # For updates from the cmd_tokens method, use manage_tokens_callback
+    if query.data.startswith("toggle_") or query.data == "save_tokens":
+        return await self.manage_tokens_callback(update, context)
+
+    # Existing logic for handling token selection
+    selected_tier = context.user_data.get('selected_tier', 1)
+    max_tokens = self.token_limits[selected_tier]
+
+    if 'selected_tokens' not in context.user_data:
+        context.user_data['selected_tokens'] = []
+
+    if query.data == "tokens_done":
+        if not context.user_data['selected_tokens']:
             await query.edit_message_text(
-                f"Great! You've selected: *{tokens_text}* for your Tier {selected_tier} subscription.\n\n"
-                "Now, choose your *entry strategy*:",
-                parse_mode='Markdown',
-                reply_markup=self.get_entry_strategy_keyboard()
+                "Please select at least one token before proceeding.",
+                reply_markup=query.message.reply_markup
             )
-            
-            return CHOOSING_ENTRY_STRATEGY
+            return CHOOSING_TOKENS
+
+        tokens_text = ", ".join(context.user_data['selected_tokens'])
+
+        # ✅ Save finalized selection to DB here
+        self.db.save_token_selection(
+            user_id=user_id,
+            tokens=context.user_data['selected_tokens'],
+            finalized=True  # <-- Make sure your DB model supports this
+        )
+
+        await query.edit_message_text(
+            f"Great! You've selected: *{tokens_text}* for your Tier {selected_tier} subscription.\n\n"
+            "Now, choose your *entry strategy*:",
+            parse_mode='Markdown',
+            reply_markup=self.get_entry_strategy_keyboard()
+        )
+
+        return CHOOSING_ENTRY_STRATEGY
+
             
         elif query.data.startswith("token_"):
             # User selected a token
